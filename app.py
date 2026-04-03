@@ -3,38 +3,115 @@ import websocket
 import json
 import pandas as pd
 import threading
+import requests
 from streamlit_autorefresh import st_autorefresh
 
-# --- KONFIGURACIJA ---
-st.set_page_config(page_title="KZS Live Advanced Stats", layout="wide")
+# --- KONFIGURACIJA STRANI ---
+st.set_page_config(page_title="KZS Live Advanced Stats", layout="wide", page_icon="🏀")
 
-# Avtomatsko osveževanje vmesnika vsakih 5 sekund
+# Avtomatsko osveževanje vmesnika na 5 sekund, da vidimo nove podatke iz ozadja
 st_autorefresh(interval=5000, key="datarefresh")
 
-st.title("🏀 KZS Live Analytics")
-st.markdown("Spremljanje slovenske košarkarske lige v realnem času.")
+# --- FUNKCIJA ZA ISKANJE TEKEM (Auto-Discovery) ---
+def get_active_matches():
+    """Poskuša pridobiti seznam trenutnih tekem s KZS."""
+    try:
+        # KZS uporablja ta interni API za seznam tekem
+        res = requests.get("https://zapisniki.kzs.si/api/v1/matches/active", timeout=5)
+        data = res.json()
+        matches = {f"{m['homeTeam']['name']} vs {m['awayTeam']['name']}": m['id'] for m in data}
+        return matches
+    except:
+        # Če API ne vrne podatkov (npr. ni tekem), vrnemo prazno
+        return {}
 
 # --- SHRAMBA PODATKOV (Session State) ---
 if 'db' not in st.session_state:
-    # Ustvarimo tabelo za hrambo vseh dogodkov
-    st.session_state.db = pd.DataFrame(columns=['vreme', 'igralec', 'ekipa', 'akcija', 'tocke'])
+    st.session_state.db = pd.DataFrame(columns=['vreme', 'ekipa', 'igralec', 'akcija', 'tocke'])
 
 if 'ws_active' not in st.session_state:
     st.session_state.ws_active = False
 
-# --- LOGIKA ZA OBDELAVO DOGODKOV ---
-def process_kzs_message(msg):
-    """Pretvori surovo sporočilo KZS v vrstico za našo tabelo."""
-    try:
-        # Pozor: Struktura JSON-a se lahko razlikuje glede na tip dogodka (met, favl, skok)
-        # Tukaj implementiraš svojo logiko mapiranja
-        new_row = {
-            'vreme': msg.get('clock', '00:00'),
-            'igralec': msg.get('playerName', 'Neznano'),
-            'ekipa': msg.get('teamName', '-'),
-            'akcija': msg.get('actionType', 'dogodek'),
-            'tocke': int(msg.get('points', 0))
+# --- LOGIKA ZA WEBSOCKET ---
+def run_websocket(match_id):
+    def on_message(ws, message):
+        data = json.loads(message)
+        if "message" in data:
+            msg = data["message"]
+            # Mapiranje KZS JSON polj v našo tabelo
+            # OPOMBA: Ključe (npr. 'score', 'player') prilagodi glede na dejanski izpis v živo
+            new_event = {
+                'vreme': msg.get('clock', '-'),
+                'ekipa': msg.get('teamName', '-'),
+                'igralec': msg.get('playerName', 'Ekipa'),
+                'akcija': msg.get('actionType', 'dogodek'),
+                'tocke': int(msg.get('points', 0)) if msg.get('points') else 0
+            }
+            # Dodajanje v DataFrame
+            st.session_state.db = pd.concat([st.session_state.db, pd.DataFrame([new_event])], ignore_index=True)
+
+    def on_open(ws):
+        sub_payload = {
+            "command": "subscribe",
+            "identifier": json.dumps({"channel": "ScoreChannel", "matchId": match_id})
         }
+        ws.send(json.dumps(sub_payload))
+
+    ws = websocket.WebSocketApp(
+        "wss://zapisniki.kzs.si/cable",
+        on_message=on_message,
+        on_open=on_open
+    )
+    ws.run_forever()
+
+# --- UPORABNIŠKI VMESNIK (UI) ---
+st.title("🏀 KZS Advanced Live Stats")
+
+# Sidebar za izbiro tekme
+st.sidebar.header("Nadzorna plošča")
+available_matches = get_active_matches()
+
+if available_matches:
+    selected_name = st.sidebar.selectbox("Izberi aktivno tekmo:", list(available_matches.keys()))
+    m_id = available_matches[selected_name]
+else:
+    st.sidebar.warning("Ni zaznanih aktivnih tekem.")
+    m_id = st.sidebar.text_input("Ročni vnos Match ID (npr. 123456):")
+
+if st.sidebar.button("Poveži se v živo"):
+    if m_id and not st.session_state.ws_active:
+        thread = threading.Thread(target=run_websocket, args=(m_id,), daemon=True)
+        thread.start()
+        st.session_state.ws_active = True
+        st.sidebar.success(f"Povezano na ID: {m_id}")
+
+# --- DASHBOARD PRIKAZ ---
+col1, col2 = st.columns([2, 1])
+
+with col1:
+    st.subheader("Play-by-Play (V živo)")
+    if not st.session_state.db.empty:
+        # Prikažemo zadnjih 15 dogodkov (novejši zgoraj)
+        st.table(st.session_state.db.iloc[::-1].head(15))
+    else:
+        st.info("Čakam na podatke... Izberi tekmo in klikni 'Poveži se'.")
+
+with col2:
+    st.subheader("Hitra Analitika")
+    if not st.session_state.db.empty:
+        # Seštevek točk po ekipah
+        team_stats = st.session_state.db.groupby('ekipa')['tocke'].sum().reset_index()
+        st.bar_chart(team_stats.set_index('ekipa'))
+        
+        # Najboljši strelci
+        st.write("Najboljši strelci:")
+        player_stats = st.session_state.db.groupby('igralec')['tocke'].sum().sort_values(ascending=False)
+        st.dataframe(player_stats)
+
+# Gumb za reset
+if st.sidebar.button("Ponovi / Počisti"):
+    st.session_state.db = pd.DataFrame(columns=['vreme', 'ekipa', 'igralec', 'akcija', 'tocke'])
+    st.rerun()        }
         return new_row
     except Exception as e:
         return None
